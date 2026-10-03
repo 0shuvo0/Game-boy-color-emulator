@@ -76,6 +76,15 @@
       </header>
       <label class="sr-only" for="aiPrompt">Describe the game you want to play</label>
       <textarea id="aiPrompt" rows="4" maxlength="500" required placeholder="For example: Pokemon fire red or A colorful platformer with exploration and collectibles"></textarea>
+      <div class="voice-input">
+        <button id="voiceSearch" type="button" class="voice-search" aria-label="Start voice search" aria-pressed="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"></path>
+            <path d="M19 11a7 7 0 0 1-14 0M12 18v4m-4 0h8"></path>
+          </svg>
+        </button>
+        <span id="voiceLabel">Tap to speak</span>
+      </div>
       <p id="aiStatus" role="status" aria-live="polite"></p>
       <footer>
         <button id="manualPick" type="button" class="link">Choose a game instead</button>

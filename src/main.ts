@@ -1,17 +1,42 @@
 import './style.css';
 import games from './games';
+import mGBA from '@thenick775/mgba-wasm';
 import { unzipSync } from 'fflate';
 import { askGemma } from './utils/ai';
 
 type Btn = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT' | 'A' | 'B' | 'START' | 'SELECT';
-declare global { interface Window { loadGame: typeof loadGame } }
+type SpeechRecognitionEventLike = {
+  resultIndex: number;
+  results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }>;
+};
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+declare global {
+  interface Window {
+    loadGame: typeof loadGame;
+    SpeechRecognition?: new () => SpeechRecognitionLike;
+    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+  }
+}
 
 const $ = <T extends HTMLElement = HTMLElement>(s: string) => document.querySelector(s) as T;
 const BASE = import.meta.env.BASE_URL;
 const ROM_EXT = /\.(gb|gbc|sgb|dmg|rom|bin)$/i;
 const BTNS: Btn[] = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A', 'B', 'START', 'SELECT'];
-// MBC types WasmBoy handles: ROM only, MBC1/2/3/5
-const SUPPORTED = new Set([0, 1, 2, 3, 5, 6, 8, 9, 0xf, 0x10, 0x11, 0x12, 0x13, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e]);
+// mGBA button names
+const MGBA_BTN: Record<Btn, string> = {
+  UP: 'up', DOWN: 'down', LEFT: 'left', RIGHT: 'right',
+  A: 'a', B: 'b', START: 'start', SELECT: 'select',
+};
 const ls = {
   get: (k: string) => { try { return localStorage.getItem(k); } catch { return null; } },
   set: (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
@@ -25,8 +50,9 @@ const resetBtn = $<HTMLButtonElement>('#reset'), hint = $('#hint');
 const aiDlg = $<HTMLDialogElement>('#aiDlg'), aiPrompt = $<HTMLTextAreaElement>('#aiPrompt');
 const aiForm = $<HTMLFormElement>('#aiForm'), recommendBtn = $<HTMLButtonElement>('#recommend');
 const aiStatus = $('#aiStatus');
+const voiceBtn = $<HTMLButtonElement>('#voiceSearch'), voiceLabel = $('#voiceLabel');
 
-let wb: any;
+let mgba: any;
 let current: { name: string; rom: Uint8Array } | null = null;
 let token = 0, autoPaused = false;
 
@@ -38,25 +64,26 @@ function toast(msg: string, kind: 'info' | 'warn' | 'error' = 'info') {
   setTimeout(() => t.remove(), kind === 'error' ? 5000 : 3000);
 }
 
-/* ---------- Emulator core (WasmBoy, lazy-loaded) ---------- */
+/* ---------- Emulator core (mGBA wasm) ---------- */
 async function initEmu() {
-  // @ts-ignore - wasmboy ships no types
-  const mod: any = await import('wasmboy');
-  wb = mod.WasmBoy ?? mod.default?.WasmBoy ?? mod.default;
-  await wb.config({
-    headless: false, useGbcWhenAvailable: true, isAudioEnabled: true, frameSkip: 0,
-    audioBatchProcessing: true, timersBatchProcessing: false, audioAccumulateSamples: true,
-    graphicsBatchProcessing: false, graphicsDisableScanlineRendering: false,
-    tileRendering: true, tileCaching: true, gameboyFrameRate: 60,
-    updateGraphicsCallback: false, updateAudioCallback: false, saveStateCallback: false,
-  });
-  await wb.setCanvas(screen);
-  wb.disableDefaultJoypad?.(); // we handle keyboard, touch and gamepad ourselves
+  mgba = await mGBA({ canvas: screen });
+  await mgba.FSInit?.();        // mounts the persistent (IndexedDB) save filesystem
+  mgba.toggleInput?.(false);    // we handle keyboard, touch and gamepad ourselves
 }
 const ready = initEmu();
 ready.catch(() => {}); // surfaced when a game is loaded
 
-const wake = () => { try { wb?.resumeAudioContext?.(); } catch { /* ignore */ } };
+const wake = () => { try { mgba?.SDL2?.audioContext?.resume?.(); } catch { /* ignore */ } };
+
+/** Write the ROM into mGBA's virtual filesystem and return its path. */
+function stageRom(name: string, rom: Uint8Array): Promise<string> {
+  // mGBA keys battery saves by file name, so keep it stable per game
+  const safe = name.replace(/[\\/]/g, '_');
+  return new Promise((res, rej) => {
+    try { mgba.uploadRom(new File([rom], safe), () => res(`/data/games/${safe}`)); }
+    catch (e) { rej(e); }
+  });
+}
 
 /* ---------- Boot chime ---------- */
 let actx: AudioContext | undefined;
@@ -110,33 +137,44 @@ function parseRom(data: Uint8Array) {
   if (data.length % 0x4000 === 512) data = data.subarray(512); // strip copier header
   if (data.length < 0x150 || data[0] === 0x3c) throw new Error('This file is not a valid Game Boy ROM');
   if (data.length > 8 * 1024 * 1024) throw new Error('This ROM is larger than any Game Boy cartridge');
-  if (!SUPPORTED.has(data[0x147])) toast('This cartridge type may not run correctly', 'warn');
   const title = String.fromCharCode(...data.subarray(0x134, 0x143)).replace(/[^\x20-\x7e]/g, '').trim();
   return { rom: data, title };
 }
 
 /* ---------- Loading pipeline ---------- */
-async function run(name: string, get: () => Promise<Uint8Array>): Promise<boolean> {
+async function run(name: string, get: () => Promise<Uint8Array>, reload = false): Promise<boolean> {
   const id = ++token;
-  try { await wb?.pause(); } catch { /* not playing */ }
+  let quit = false; // true once the previous game has been shut down
+  try { mgba?.pauseGame?.(); } catch { /* not playing */ }
   setOverlay('loading'); progress(0);
   try {
     const [raw] = await Promise.all([get(), ready]);
     if (id !== token) return false;
     const { rom, title } = parseRom(raw);
-    setOverlay('boot'); setTimeout(chime, 900);
-    await Promise.all([wb.loadROM(rom.slice()), sleep(1500)]); // slice: the worker may take ownership of the buffer
+    // mGBA picks the system from the header; the extension just keeps things tidy
+    const ext = rom[0x143] & 0x80 ? 'gbc' : 'gb';
+    const fileName = reload ? name : name.replace(/\.[^.]+$/, '') + '.' + ext;
+    const path = await stageRom(fileName, rom.slice());
     if (id !== token) return false;
-    await wb.play(); wb.disableDefaultJoypad?.(); wake();
+    setOverlay('boot'); setTimeout(chime, 900);
+    await sleep(1500);
+    if (id !== token) return false;
+    try { mgba.quitGame?.(); } catch { /* nothing running */ }
+    quit = true;
+    if (!mgba.loadGame(path)) throw new Error('mGBA could not start this ROM');
+    mgba.toggleInput?.(false);
+    releaseAll(); wake();
     current = { name, rom };
     led.classList.add('on'); resetBtn.disabled = false; setOverlay('hidden');
     document.title = `${title || pretty(name)} · Game Boy Color`;
-    last = ''; sync();
     return true;
   } catch (e: any) {
     if (id !== token) return false;
     toast(e?.message || 'Could not load this game', 'error');
-    if (current) { setOverlay('hidden'); try { await wb.play(); } catch { /* ignore */ } } else setOverlay('idle');
+    if (current && !quit) { setOverlay('hidden'); try { mgba.resumeGame?.(); } catch { /* ignore */ } }
+    else {
+      current = null; led.classList.remove('on'); resetBtn.disabled = true; setOverlay('idle');
+    }
     return false;
   }
 }
@@ -157,16 +195,24 @@ window.loadGame = loadGame;
 
 /* ---------- Input: keyboard + touch/mouse + gamepad ---------- */
 const held = { kb: new Set<Btn>(), ui: new Set<Btn>(), pad: new Set<Btn>() };
-let last = '';
+const down = new Set<Btn>(); // what mGBA currently believes is pressed
+
 function sync() {
   const all = new Set<Btn>([...held.kb, ...held.ui, ...held.pad]);
-  const state: Record<string, boolean> = {};
-  BTNS.forEach((b) => (state[b] = all.has(b)));
-  const key = JSON.stringify(state);
-  if (key === last) return;
-  last = key;
-  try { wb?.setJoypadState(state); } catch { /* not ready */ }
+  for (const b of BTNS) {
+    const want = all.has(b), have = down.has(b);
+    if (want === have) continue;
+    try {
+      if (want) mgba?.buttonPress(MGBA_BTN[b]); else mgba?.buttonUnpress(MGBA_BTN[b]);
+      want ? down.add(b) : down.delete(b);
+    } catch { /* not ready */ }
+  }
   document.querySelectorAll<HTMLElement>('[data-btn]').forEach((e) => e.classList.toggle('on', all.has(e.dataset.btn as Btn)));
+}
+function releaseAll() {
+  held.kb.clear(); held.ui.clear(); held.pad.clear();
+  for (const b of down) { try { mgba?.buttonUnpress(MGBA_BTN[b]); } catch { /* ignore */ } }
+  down.clear(); sync();
 }
 
 const KEYS: Record<string, Btn> = {
@@ -175,7 +221,7 @@ const KEYS: Record<string, Btn> = {
 };
 addEventListener('keydown', (e) => {
   const b = KEYS[e.code];
-  if (!b || dlg.open || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (!b || dlg.open || aiDlg.open || e.ctrlKey || e.metaKey || e.altKey) return;
   if (b === 'START' && (e.target as HTMLElement).tagName === 'BUTTON') return;
   e.preventDefault(); wake(); held.kb.add(b); sync();
 });
@@ -259,6 +305,81 @@ $('#open').addEventListener('click', () => file.click());
 file.addEventListener('change', () => { const f = file.files?.[0]; file.value = ''; if (f) { closeList(); loadGame(f); } });
 
 /* ---------- AI game picker ---------- */
+const SpeechRecognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
+let speechRecognition: SpeechRecognitionLike | null = null;
+if (!SpeechRecognition) {
+  voiceBtn.disabled = true;
+  voiceBtn.setAttribute('aria-label', 'Voice search is not supported in this browser');
+  voiceLabel.textContent = 'Voice search is not supported in this browser';
+}
+
+function setVoiceListening(listening: boolean) {
+  voiceBtn.classList.toggle('listening', listening);
+  voiceBtn.setAttribute('aria-pressed', String(listening));
+  voiceBtn.setAttribute('aria-label', listening ? 'Stop voice search' : 'Start voice search');
+  voiceLabel.textContent = listening ? 'Listening… tap to finish' : 'Tap to speak';
+}
+
+voiceBtn.addEventListener('click', () => {
+  if (!SpeechRecognition) return;
+  if (speechRecognition) {
+    speechRecognition.stop();
+    return;
+  }
+
+  const recognition = new SpeechRecognition();
+  speechRecognition = recognition;
+  const prefix = aiPrompt.value.trim();
+  let finalTranscript = '';
+  let failed = false;
+  recognition.continuous = false;
+  recognition.interimResults = true;
+  recognition.lang = navigator.language;
+  recognition.onresult = (event) => {
+    let interimTranscript = '';
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      if (result.isFinal) finalTranscript += result[0].transcript;
+      else interimTranscript += result[0].transcript;
+    }
+    const spoken = `${finalTranscript}${interimTranscript}`.trim();
+    aiPrompt.value = [prefix, spoken].filter(Boolean).join(' ').slice(0, aiPrompt.maxLength);
+  };
+  recognition.onerror = (event) => {
+    failed = true;
+    const message = event.error === 'not-allowed' || event.error === 'service-not-allowed'
+      ? 'Allow microphone access to use voice search.'
+      : event.error === 'no-speech'
+        ? 'No speech was detected. Tap the mic and try again.'
+        : `Voice search failed (${event.error}). Please try again.`;
+    aiStatus.textContent = message;
+  };
+  recognition.onend = () => {
+    if (speechRecognition !== recognition) return;
+    speechRecognition = null;
+    setVoiceListening(false);
+    if (!failed && aiDlg.open && aiPrompt.value.trim()) aiForm.requestSubmit();
+  };
+  aiStatus.textContent = '';
+  setVoiceListening(true);
+  try {
+    recognition.start();
+  } catch (e) {
+    speechRecognition = null;
+    setVoiceListening(false);
+    const message = e instanceof Error ? e.message : 'Could not start voice search.';
+    aiStatus.textContent = message;
+    toast(message, 'error');
+  }
+});
+
+aiDlg.addEventListener('close', () => {
+  const recognition = speechRecognition;
+  speechRecognition = null;
+  setVoiceListening(false);
+  recognition?.abort();
+});
+
 function markAiPromptSeen() { ls.set('gbc-ai-prompt-seen', '1'); }
 function openAiPrompt() {
   aiStatus.textContent = '';
@@ -318,7 +439,12 @@ aiForm.addEventListener('submit', async (e) => {
 });
 
 /* ---------- Misc UI ---------- */
-resetBtn.addEventListener('click', () => { if (current) { const { name, rom } = current; run(name, async () => rom); resetBtn.blur(); } });
+resetBtn.addEventListener('click', () => {
+  if (!current) return;
+  resetBtn.blur();
+  try { mgba.quickReload(); } // soft reset, keeps the same ROM and save
+  catch { const { name, rom } = current; run(name, async () => rom, true); }
+});
 const showHint = (s: boolean, save = true) => { hint.hidden = !s; if (save) ls.set('gbc-hint', s ? '1' : '0'); };
 const initialHint = (() => {
   const saved = ls.get('gbc-hint');
@@ -328,13 +454,13 @@ showHint(initialHint, false);
 $('#hintX').addEventListener('click', () => showHint(false));
 $('#kb').addEventListener('click', (e) => { showHint(Boolean(hint.hidden)); (e.currentTarget as HTMLElement).blur(); });
 
-// Pause in the background (also lets WasmBoy flush battery saves), resume on return
+// Pause in the background, resume on return (mGBA persists saves to IndexedDB on its own)
 document.addEventListener('visibilitychange', () => {
-  if (!current || !wb) return;
-  if (document.hidden) { autoPaused = true; try { wb.pause(); } catch { /* ignore */ } }
-  else if (autoPaused) { autoPaused = false; try { wb.play(); wake(); } catch { /* ignore */ } }
+  if (!current || !mgba) return;
+  if (document.hidden) { autoPaused = true; try { mgba.pauseGame(); } catch { /* ignore */ } }
+  else if (autoPaused) { autoPaused = false; try { mgba.resumeGame(); wake(); } catch { /* ignore */ } }
 });
-addEventListener('pagehide', () => { try { wb?.pause(); } catch { /* ignore */ } });
+addEventListener('pagehide', () => { try { mgba?.pauseGame(); } catch { /* ignore */ } });
 
 // Drag & drop a ROM (or ZIP) anywhere on the page
 addEventListener('dragover', (e) => { e.preventDefault(); document.body.classList.add('drag'); });
