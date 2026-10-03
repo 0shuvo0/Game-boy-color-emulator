@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0c0e11" />
+  <title>Game Boy Color</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect x='22' y='4' width='56' height='92' rx='8' fill='%231da3b8'/><rect x='30' y='12' width='40' height='34' rx='3' fill='%23333'/></svg>" />
+</head>
+<body>
+  <main class="stage">
+    <div class="gbc" id="gbc">
+      <div class="shell">
+        <div class="bezel">
+          <div class="led-wrap"><i class="led" id="led"></i>POWER</div>
+          <div class="lcd">
+            <canvas id="screen" width="160" height="144"></canvas>
+            <div class="overlay" id="overlay" data-state="idle">
+              <div class="logo"><b>GAME BOY</b><small>Nintendo®</small></div>
+              <div class="bar"><i id="barFill"></i></div>
+            </div>
+          </div>
+          <div class="brand">GAME BOY <span>C</span><span>O</span><span>L</span><span>O</span><span>R</span></div>
+        </div>
+
+        <div class="nintendo">Nintendo</div>
+
+        <div class="dpad" id="dpad" aria-label="Directional pad">
+          <i class="u" data-btn="UP">▲</i><i class="l" data-btn="LEFT">◀</i><i class="c"></i>
+          <i class="r" data-btn="RIGHT">▶</i><i class="d" data-btn="DOWN">▼</i>
+        </div>
+        <button class="btn round b" data-btn="B" aria-label="B button">B</button>
+        <button class="btn round a" data-btn="A" aria-label="A button">A</button>
+        <button class="btn pill sel" data-btn="SELECT" data-label="SELECT" aria-label="Select"></button>
+        <button class="btn pill start" data-btn="START" data-label="START" aria-label="Start"></button>
+        <div class="speaker"></div>
+      </div>
+    </div>
+
+    <div class="dock">
+      <div class="hint" id="hint">
+        <span><kbd>←↑↓→</kbd>D-pad</span>
+        <span><kbd>Z</kbd>A</span>
+        <span><kbd>X</kbd>B</span>
+        <span><kbd>Enter</kbd>Start</span>
+        <span><kbd>Shift</kbd>Select</span>
+        <button id="hintX" class="x" aria-label="Hide keyboard controls">✕</button>
+      </div>
+      <div class="actions">
+        <button id="aiPick" class="ai-pick">AI pick</button>
+        <button id="load" class="load">Load game</button>
+        <button id="reset" class="icon" title="Restart game" aria-label="Restart game" disabled>↻</button>
+        <button id="kb" class="icon" title="Keyboard controls" aria-label="Show keyboard controls">⌨</button>
+      </div>
+    </div>
+  </main>
+
+  <dialog id="dlg" aria-label="Select a game">
+    <header>
+      <h2>Select a game</h2>
+      <input id="search" type="search" placeholder="Search games" autocomplete="off" />
+    </header>
+    <ul id="list"></ul>
+    <footer>
+      <button id="open" class="link">Open ROM from device…</button>
+      <button id="close" class="link">Close</button>
+    </footer>
+    <input id="file" type="file" hidden accept=".gb,.gbc,.sgb,.dmg,.rom,.bin,.zip" />
+  </dialog>
+
+  <dialog id="aiDlg" aria-labelledby="aiTitle">
+    <form id="aiForm">
+      <header>
+        <h2 id="aiTitle">What would you like to play?</h2>
+        <p>Enter game name or describe the kind of Game Boy game you’re in the mood for and AI will pick one from this collection.</p>
+      </header>
+      <label class="sr-only" for="aiPrompt">Describe the game you want to play</label>
+      <textarea id="aiPrompt" rows="4" maxlength="500" required placeholder="For example: Pokemon fire red or A colorful platformer with exploration and collectibles"></textarea>
+      <p id="aiStatus" role="status" aria-live="polite"></p>
+      <footer>
+        <button id="manualPick" type="button" class="link">Choose a game instead</button>
+        <div>
+          <button id="skipAi" type="button" class="link">Not now</button>
+          <button id="recommend" class="recommend" type="submit">Find my game</button>
+        </div>
+      </footer>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
